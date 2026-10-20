@@ -1,136 +1,319 @@
-pub const Device = struct {
-    // Specify the underlying XML schema to which the CMSIS-SVD schema is compliant.
-    // Has to be set to: "http://www.w3.org/2001/XMLSchema-instance".
-    @"xmlns:xs": []const u8,
-    // Specify the file path and file name of the CMSIS-SVD Schema. For example, CMSIS-SVD.xsd.
-    @"xs:noNamespaceSchemaLocation": []const u8,
-    // Specify the compliant CMSIS-SVD schema version (for example, 1.1).
-    schemaVersion: []const u8,
+//! In-memory representation of a CMSIS-SVD document.
+//!
+//! The model mirrors the element hierarchy described by the CMSIS-SVD
+//! specification:
+//!
+//!   device -> peripherals -> registers/clusters -> fields -> enumeratedValues
+//!
+//! Inheritance of register properties (size, access, resetValue, resetMask)
+//! is resolved by the parser: every peripheral, cluster and register stores
+//! the properties that are effective for its subtree.  Optional values that
+//! are still absent after inheritance mean "not specified by the SVD file".
 
-    // Specify the vendor of the device using the full name.
-    vendor: []const u8,
-    // Specify the vendor abbreviation without spaces or special characters.
-    // This information is used to define the directory.
-    vendorID: []const u8,
-    // The string identifies the device or device series. Device names are required to be unique.
-    name: []const u8,
-    // Specify the name of the device series.
-    series: []const u8,
-    // Define the version of the SVD file. Silicon vendors maintain the description throughout
-    //  the life-cycle of the device and ensure that all updated and released copies have a unique
-    //  version string. Higher numbers indicate a more recent version.
-    version: []const u8,
-    // Describe the main features of the device (for example CPU, clock frequency, peripheral overview).
-    description: []const u8,
-    // The text will be copied into the header section of the generated device header file and
-    //  shall contain the legal disclaimer. New lines can be inserted by using \n. This section
-    //  is mandatory if the SVD file is used for generating the device header file.
-    licenseText: []const u8,
-    // Describe the processor included in the device.
-    cpu: []const u8,
-    // Specify the file name (without extension) of the device-specific system include file
-    // (system_<device>.h; See CMSIS-Core description). The header file generator customizes
-    //  the include statement referencing the CMSIS system file within the CMSIS device header
-    //  file. By default, the filename is system_device-name.h. In cases where a device series
-    //  shares a single system header file, the name of the series shall be used instead of the
-    //  individual device name.
-    headerSystemFilename: []const u8,
-    // This string is prepended to all type definition names generated in the CMSIS-Core device
-    //  header file. This is used if the vendor's software requires vendor-specific types in
-    //  order to avoid name clashes with other definied types.
-    headerDefinitionsPrefix: []const u8,
-    // Define the number of data bits uniquely selected by each address. The value for
-    //  Cortex-M-based devices is 8 (byte-addressable).
-    addressUnitBits:[]const u8,
-    // Define the number of data bit-width of the maximum single data transfer supported by the
-    //  bus infrastructure. This information is relevant for debuggers when accessing registers,
-    //  because it might be required to issue multiple accesses for resources of a bigger size.
-    //  The expected value for Cortex-M-based devices is 32.
-    width:[]const u8,
-    // Default bit-width of any register contained in the device.
-    size: []const u8,
-    // Default access rights for all registers.
-    access: ?Access,
-    // Default access protection for all registers. protectionStringType 0..1
-    protection: []const u8,
-    // Default value for all registers at RESET. scaledNonNegativeInteger 0..1
-    resetValue: []const u8,
-    // Define which register bits have a defined reset value. scaledNonNegativeInteger 0..1
-    resetMask: []const u8,
-    // Group to define peripherals.   1..1
-    peripherals: Peripherals,
-    // The content and format of this section is unspecified. Silicon vendors may choose to provide
-    //  additional information. By default, this section is ignored when constructing CMSIS files.
-    // It is up to the silicon vendor to specify a schema for this section. xs:anyType (restriction) 0..1
-    vendorExtensions: []const u8,
+const std = @import("std");
+
+/// Access rights of a register or field (`accessType` in the schema).
+pub const Access = enum {
+    read_only,
+    write_only,
+    read_write,
+    write_once,
+    read_write_once,
+
+    /// Human readable form used in generated documentation comments.
+    pub fn label(self: Access) []const u8 {
+        return switch (self) {
+            .read_only => "Read-Only",
+            .write_only, .write_once => "Write-Only",
+            .read_write, .read_write_once => "Read-Write",
+        };
+    }
 };
 
-pub const Access = enum {
+/// Write side effects (`modifiedWriteValuesType` in the schema).
+pub const ModifiedWriteValues = enum {
+    one_to_clear,
+    one_to_set,
+    one_to_toggle,
+    zero_to_clear,
+    zero_to_set,
+    zero_to_toggle,
+    clear,
+    set,
+    modify,
+};
+
+/// Read side effects (`readActionType` in the schema).
+pub const ReadAction = enum {
+    clear,
+    set,
+    modify,
+    modify_external,
+};
+
+/// The `usage` of an enumeratedValues set.
+pub const EnumUsage = enum {
     read,
     write,
-    @"read-write",
+    read_write,
 };
 
-pub const Peripherals = struct {
-    peripherals: []Peripheral,
+/// Endianness of the processor (`endianType` in the schema).
+pub const Endian = enum {
+    little,
+    big,
+    selectable,
+    other,
 };
 
+/// Usage of an address block.
+pub const AddressBlockUsage = enum {
+    registers,
+    buffer,
+    reserved,
+};
+
+/// Inclusive range used by a write constraint.
+pub const WriteRange = struct {
+    minimum: u64,
+    maximum: u64,
+};
+
+/// A subrange of values that may be written to a field or register.
+pub const WriteConstraint = union(enum) {
+    write_as_read: bool,
+    use_enumerated_values: bool,
+    range: WriteRange,
+};
+
+/// Inclusive bit range of a field within its register.
+pub const BitRange = struct {
+    offset: u32,
+    width: u32,
+};
+
+/// Properties inherited from device -> peripheral -> cluster -> register.
+pub const RegisterProperties = struct {
+    /// Register width in bits (`size`).
+    size: ?u32 = null,
+    access: ?Access = null,
+    /// CMSIS protection string, e.g. "s", "n" or "p".
+    protection: ?[]const u8 = null,
+    reset_value: ?u64 = null,
+    reset_mask: ?u64 = null,
+
+    /// Applies `overrides` on top of `base`.
+    pub fn merged(base: RegisterProperties, overrides: RegisterProperties) RegisterProperties {
+        return .{
+            .size = overrides.size orelse base.size,
+            .access = overrides.access orelse base.access,
+            .protection = overrides.protection orelse base.protection,
+            .reset_value = overrides.reset_value orelse base.reset_value,
+            .reset_mask = overrides.reset_mask orelse base.reset_mask,
+        };
+    }
+
+    /// Effective access, defaulting to read-write when the SVD does not say.
+    pub fn effectiveAccess(self: RegisterProperties) Access {
+        return self.access orelse .read_write;
+    }
+
+    /// Effective register width in bits.
+    pub fn effectiveSize(self: RegisterProperties) u32 {
+        return self.size orelse 32;
+    }
+};
+
+/// The `dimElementGroup`: description of an array of peripherals, clusters,
+/// registers or fields.
+pub const DimElement = struct {
+    /// Number of array elements.
+    dim: u32,
+    /// Address increment between elements. Bytes for peripherals, clusters and
+    /// registers; bits for fields.
+    dim_increment: u64,
+    /// Optional index description, e.g. "0-3", "A-D" or "0,1,2,3".
+    dim_index: ?[]const u8 = null,
+    /// Optional name of the C array.
+    dim_name: ?[]const u8 = null,
+    dim_array_index: ?DimArrayIndex = null,
+};
+
+/// Enumerated index names attached to an array (`dimArrayIndexType`).
+pub const DimArrayIndex = struct {
+    header_enum_name: ?[]const u8 = null,
+    values: []EnumeratedValue = &.{},
+};
+
+/// One value of an enumeration.
+pub const EnumeratedValue = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    /// Numeric value. `null` for `isDefault` entries or values that use
+    /// binary don't-care bits such as `0b1xx`.
+    value: ?u64 = null,
+    is_default: bool = false,
+};
+
+/// An `enumeratedValues` element. A field may contain up to two of them
+/// (one for read access and one for write access).
+pub const EnumeratedValues = struct {
+    name: ?[]const u8 = null,
+    header_enum_name: ?[]const u8 = null,
+    usage: ?EnumUsage = null,
+    derived_from: ?[]const u8 = null,
+    values: []EnumeratedValue = &.{},
+};
+
+/// A bit field of a register.
+pub const Field = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    bit_range: ?BitRange = null,
+    access: ?Access = null,
+    modified_write_values: ?ModifiedWriteValues = null,
+    write_constraint: ?WriteConstraint = null,
+    read_action: ?ReadAction = null,
+    enumerated_values: []EnumeratedValues = &.{},
+    dim: ?DimElement = null,
+    derived_from: ?[]const u8 = null,
+};
+
+/// A register.
+pub const Register = struct {
+    name: []const u8,
+    display_name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    alternate_group: ?[]const u8 = null,
+    alternate_register: ?[]const u8 = null,
+    address_offset: u64 = 0,
+    /// Effective properties after inheritance.
+    properties: RegisterProperties = .{},
+    /// Properties explicitly written on this register.  Used when resolving
+    /// `derivedFrom`, where unspecified properties come from the base.
+    local_properties: RegisterProperties = .{},
+    data_type: ?[]const u8 = null,
+    modified_write_values: ?ModifiedWriteValues = null,
+    write_constraint: ?WriteConstraint = null,
+    read_action: ?ReadAction = null,
+    fields: []Field = &.{},
+    dim: ?DimElement = null,
+    derived_from: ?[]const u8 = null,
+};
+
+/// A cluster groups registers and other clusters at an address offset.
+pub const Cluster = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    alternate_cluster: ?[]const u8 = null,
+    header_struct_name: ?[]const u8 = null,
+    address_offset: u64 = 0,
+    /// Effective properties after inheritance.
+    properties: RegisterProperties = .{},
+    /// Properties explicitly written on this cluster.
+    local_properties: RegisterProperties = .{},
+    children: []RegisterNode = &.{},
+    dim: ?DimElement = null,
+    derived_from: ?[]const u8 = null,
+};
+
+/// A register or a cluster inside a `registers` section.
+pub const RegisterNode = union(enum) {
+    register: Register,
+    cluster: Cluster,
+};
+
+/// An address block assigned to a peripheral.
+pub const AddressBlock = struct {
+    offset: u64,
+    size: u64,
+    usage: AddressBlockUsage = .registers,
+    protection: ?[]const u8 = null,
+};
+
+/// An interrupt associated with a peripheral.
+pub const Interrupt = struct {
+    name: []const u8,
+    description: ?[]const u8 = null,
+    value: i64 = 0,
+};
+
+/// Processor description of the device.
+pub const Cpu = struct {
+    name: []const u8,
+    revision: ?[]const u8 = null,
+    endian: Endian = .other,
+    mpu_present: ?bool = null,
+    fpu_present: ?bool = null,
+    fpu_dp: ?bool = null,
+    dsp_present: ?bool = null,
+    icache_present: ?bool = null,
+    dcache_present: ?bool = null,
+    itcm_present: ?bool = null,
+    dtcm_present: ?bool = null,
+    vtor_present: ?bool = null,
+    nvic_prio_bits: u32 = 0,
+    vendor_systick_config: bool = false,
+    device_num_interrupts: ?u32 = null,
+    sau_num_regions: ?u32 = null,
+};
+
+/// A peripheral of the device.
 pub const Peripheral = struct {
-    // Define the number of elements in an array. scaledNonNegativeInteger 0..1
-    dim: []const u8,
-    // Specify the address increment, in Bytes, between two neighboring array members in the address map. scaledNonNegativeInteger 0..1
-    dimIncrement: []const u8,
-    // Do not define on peripheral level. By default, <dimIndex> is an integer value starting at 0. dimIndexType 0..1
-    dimIndex: void,
-    // Specify the name of the C-type structure. If not defined, then the entry of the <name> element is used. idnetifierType 0..1
-    dimName: void,
-    // Grouping element to create enumerations in the header file. dimArrayIndexType 0..1
-    dimArrayIndex: void,
-    // The string identifies the peripheral. Peripheral names are required to be unique for a device. The name needs to be an ANSI C identifier to generate the header file. You can use the placeholder [%s] to create arrays. dimableIdentifierType 1..1
-    name: void,
-    // The string specifies the version of this peripheral description. xs:string 0..1
-    version: void,
-    // The string provides an overview of the purpose and functionality of the peripheral. xs:string 0..1
-    description: void,
-    // All address blocks in the memory space of a device are assigned to a unique peripheral by default. If multiple peripherals describe the same address blocks, then this needs to be specified explicitly. A peripheral redefining an address block needs to specify the name of the peripheral that is listed first in the description. dimaleIdentifierType 0..1
-    alternatePeripheral: void,
-    // Define a name under which the System Viewer is showing this peripheral. xs:Name 0..1
-    groupName: void,
-    // Define a string as prefix. All register names of this peripheral get this prefix. identifierType 0..1
-    prependToName: void,
-    // Define a string as suffix. All register names of this peripheral get this suffix. identifierType 0..1
-    appendToName: void,
-    // Specify the base name of C structures. The headerfile generator uses the name of a peripheral as the base name for the C structure type. If <headerStructName> element is specfied, then this string is used instead of the peripheral name; useful when multiple peripherals get derived and a generic type name should be used. dimableIdentifierType 0..1
-    headerStructName: void,
-    // Define a C-language compliant logical expression returning a TRUE or FALSE result. If TRUE, refreshing the display for this peripheral is disabled and related accesses by the debugger are suppressed.
-    disableCondition: void,
-    // constants and references to other registers contained in the description are allowed: <peripheral>-><register>-><field>, for example, (System->ClockControl->apbEnable == 0). The following operators are allowed in the expression [&&,||, ==, !=, >>, <<, &, |].
-    
-    Only: void,
-    //
-    Attention: void,
-    // this feature only in cases where accesses from the debugger to registers of un-clocked peripherals result in severe debugging failures. SVD is intended to provide static information and does not include any run-time computation or functions. Such capabilities can be added by the tools, and is beyond the scope of this description language.
-    Use: void,
-    // 0..1
-    stringType: void,
-    // Lowest address reserved or used by the peripheral. scaledNonNegativeInteger 1..1
-    baseAddress: void,
-    // to registerPropertiesGroup for details about the colored elements.  
-     	Refer: void,
-    // Define the default bit-width of any register contained in the device (implicit inheritance). scaledNonNegativeInteger 0..1
-    size: void,
-    // Define default access rights for all registers. accessType 0..1
-    access: void,
-    // Define default protection rights for all registers. protectionStringType 0..1
-    protection: void,
-    // Define the default value for all registers at RESET. scaledNonNegativeInteger 0..1
-    resetValue: void,
-    // Identify which register bits have a defined reset value. scaledNonNegativeInteger 0..1
-    resetMask: void,
-    // Specify an address range uniquely mapped to this peripheral. A peripheral must have at least one address block, but can allocate multiple distinct address ranges. If a peripheral is derived from another peripheral, the addressBlock is not mandatory. addressBlockType 0/1..*
-    addressBlock: void,
-    // A peripheral can have multiple associated interrupts. This entry allows the debugger to show interrupt names instead of interrupt numbers. interruptType 0..*
-    interrupt: void,
-    // Group to enclose register definitions. registersType 0..1
-    registers: void,
+    name: []const u8,
+    version: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    alternate_peripheral: ?[]const u8 = null,
+    group_name: ?[]const u8 = null,
+    prepend_to_name: ?[]const u8 = null,
+    append_to_name: ?[]const u8 = null,
+    header_struct_name: ?[]const u8 = null,
+    disable_condition: ?[]const u8 = null,
+    base_address: u64 = 0,
+    /// Effective properties after inheritance.
+    properties: RegisterProperties = .{},
+    /// Properties explicitly written on this peripheral.
+    local_properties: RegisterProperties = .{},
+    address_blocks: []AddressBlock = &.{},
+    interrupts: []Interrupt = &.{},
+    registers: []RegisterNode = &.{},
+    dim: ?DimElement = null,
+    derived_from: ?[]const u8 = null,
 };
+
+/// The root `device` element.
+pub const Device = struct {
+    schema_version: ?[]const u8 = null,
+    vendor: ?[]const u8 = null,
+    vendor_id: ?[]const u8 = null,
+    name: []const u8,
+    series: ?[]const u8 = null,
+    version: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    license_text: ?[]const u8 = null,
+    cpu: ?Cpu = null,
+    header_system_filename: ?[]const u8 = null,
+    header_definitions_prefix: ?[]const u8 = null,
+    /// Size of the smallest addressable unit in bits.
+    address_unit_bits: u32 = 8,
+    /// Maximum single transfer width in bits.
+    width: u32 = 32,
+    /// Device-level register defaults.
+    properties: RegisterProperties = .{},
+    peripherals: []Peripheral = &.{},
+    /// True when a vendorExtensions section was present (its content is
+    /// intentionally ignored).
+    has_vendor_extensions: bool = false,
+};
+
+test "register properties merge" {
+    const base: RegisterProperties = .{
+        .size = 32,
+        .access = .read_write,
+        .reset_value = 0,
+    };
+    const merged = RegisterProperties.merged(base, .{ .access = .read_only });
+    try std.testing.expectEqual(@as(?u32, 32), merged.size);
+    try std.testing.expectEqual(Access.read_only, merged.access.?);
+    try std.testing.expectEqual(@as(?u64, 0), merged.reset_value);
+}
