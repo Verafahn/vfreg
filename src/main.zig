@@ -17,7 +17,7 @@ pub fn main(init: std.process.Init) !void {
         io,
         input_path,
         arena,
-        .limited(512 * 1024 * 1024),
+        .unlimited,
     );
 
     var parser: vfreg.parser.Parser = .init(arena, data);

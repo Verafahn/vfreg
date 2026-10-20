@@ -1,6 +1,6 @@
 .{
     .name = .vfreg,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .dependencies = .{
         .xml = .{
             .url = "https://github.com/ianprime0509/zig-xml/archive/refs/tags/0.2.2.tar.gz",
